@@ -4,3 +4,5 @@ __pycache__
 
 # notes on my dokku server
 .dokku/MY_DOKKU.md 
+authorized_users.json
+config.json

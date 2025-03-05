@@ -1,0 +1,4 @@
+python-dotenv
+python-telegram-bot
+groq
+requests>=2.32.0
