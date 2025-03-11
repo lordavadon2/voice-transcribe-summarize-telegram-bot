@@ -1,16 +1,35 @@
 import os
 import json
+import logging
 import tempfile
 import requests
+from logging.handlers import RotatingFileHandler
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 from telegram.ext import CallbackQueryHandler
 
 from groq import Groq
+
 from dotenv import load_dotenv
 
 load_dotenv()
+
+# --- Настройка системы логирования ---
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        RotatingFileHandler(
+            'bot.log',
+            maxBytes=5*1024*1024,  # 5 MB
+            backupCount=3,
+            encoding='utf-8'
+        ),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
 
 # --- Configuration Loading and Saving ---
 def load_users():
@@ -44,12 +63,21 @@ def is_admin(user_id: int) -> bool:
     '''Check if user is admin'''
     return user_id == ADMIN_ID
 
+def get_user_details(user) -> dict:
+    """Извлекает данные пользователя с обработкой отсутствующих полей"""
+    return {
+        'id': user.id,
+        'first_name': user.first_name or 'N/A',
+        'last_name': user.last_name or 'N/A',
+        'username': f"@{user.username}" if user.username else 'N/A'
+    }
+
 def get_message_keyboard(user_id: int):
     """Generate keyboard for regular messages based on user permissions"""
     if is_admin(user_id):
-        keyboard = [[InlineKeyboardButton("Admin", callback_data="admin_panel")]]
+        keyboard = [[InlineKeyboardButton("Адмін", callback_data="admin_panel")]]
     else:
-        keyboard = [[InlineKeyboardButton("Mode", callback_data="change_mode")]]
+        keyboard = [[InlineKeyboardButton("Режим", callback_data="change_mode")]]
     
     return InlineKeyboardMarkup(keyboard)
 
@@ -59,7 +87,7 @@ async def fetch_models(client: Groq):
         response = client.models.list()
         return [model.id for model in response.data]
     except Exception as e:
-        print(f"Error fetching models: {str(e)}")
+        logger.error(f"Помилка отримання моделей: {str(e)}")
         return [
             "llama-3.3-70b-versatile",
             "mixtral-8x7b-32768",
@@ -70,7 +98,7 @@ async def fetch_models(client: Groq):
 # --- Command Handlers ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Send a message when the command /start is issued."""
-    print(f"Received start command from user: {update.effective_user.id}")
+    logger.info(f"Отримання команди /start: {update.effective_user.id}")
     user_name = update.effective_user.first_name
     
     try:
@@ -78,33 +106,52 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup = get_message_keyboard(user_id)
         
         await update.message.reply_text(
-            f"👋 Hi {user_name}! I'm a Voice Note Summarizer Bot.\n\n"
-            "You can:\n"
-            "1. Forward me voice messages\n"
-            "2. Send me direct voice recordings\n\n"
-            "I'll transcribe them and provide you with both the transcription and a summary!",
+            f"👋 Привіт {user_name}! Я бот для транскрипції та резюме голосових повідомлень.\n\n"
+            "Ви можете:\n"
+            "1. Переслати мені голосові повідомлення\n"
+            "2. Надіслати мені прямі записи голосу\n\n"
+            "Я перекодую їх та надам вам транскрицію та резюме!",
             reply_markup=reply_markup
         )
         
-        print(f"Sent welcome message to user: {update.effective_user.id}")
+        logger.info(f"Надіслано привітальне повідомлення користувачу: {update.effective_user.id}")
     except Exception as e:
-        print(f"Error in start handler: {str(e)}")
+        logger.error(f"Помилка в обробнику запуску: {str(e)}")
 
 async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle voice messages and voice notes."""
+    user = update.effective_user
+    user_data = get_user_details(user)
+
     try:
-        if update.effective_user.id not in AUTHORIZED_USERS:
-            await update.message.reply_text("⛔ Sorry, you are not authorized to use this bot. Contact @administrator.")
+        if user.id not in AUTHORIZED_USERS:
+            logger.warning(
+            "Спроба несанкціонованого доступу | Дані: %s",
+            user_data
+            )
+            await update.message.reply_text("⛔ Доступ заборонено")
             return
         
-        status_message = await update.message.reply_text("🎵 Processing your voice note...")
+        status_message = await update.message.reply_text("🎵 Обробка голосового повідомлення...")
+
+        logger.info(
+            "Обробка голосового повідомлення | Користувач: %s | ID файла: %s",
+            user_data['username'],
+            update.message.voice.file_id
+        )
         
         voice_file = await update.message.voice.get_file()
         with tempfile.NamedTemporaryFile(suffix='.ogg', delete=False) as temp_file:
             await voice_file.download_to_drive(temp_file.name)
             temp_path = temp_file.name
         
+        logger.info("Початок транскрипції | Користувач: %s", user_data['username'])
         transcription = await transcribe_audio(temp_path, context)
+        logger.info(
+            "Успішна транскрипція | Користувач: %s | Символів: %d",
+            user_data['username'],
+            len(transcription)
+        )
 
         user_id = update.effective_user.id
         reply_markup = get_message_keyboard(user_id)
@@ -112,78 +159,87 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         if user_mode == "transcription":
             if len(transcription) > 3000:
-                await status_message.edit_text("📝 *Transcription (Part 1):*", parse_mode='Markdown')
+                await status_message.edit_text("📝 *транскрипція (Частина 1):*", parse_mode='Markdown')
                 chunk_size = 4000
                 transcription_chunks = [transcription[i:i + chunk_size] for i in range(0, len(transcription), chunk_size)]
                 for i, chunk in enumerate(transcription_chunks, 1):
                     await update.message.reply_text(
-                        f"*Transcription (Part {i}):*\n{chunk}",
+                        f"*Транскрипція (Частина {i}):*\n{chunk}",
                         parse_mode='Markdown',
                         reply_markup=reply_markup
                     )
             else:
                 await status_message.edit_text(
-                    "📝 *Transcription:*\n"
+                    "📝 *Транскрипція:*\n"
                     f"{transcription}",
                     parse_mode='Markdown',
                     reply_markup=reply_markup
                 )
         else:
+            logger.info("Початок резюме | Користувач: %s", user_data['username'])
             summary = await generate_summary(transcription, context)
+            logger.info(
+                "Успішне резюме | Користувач: %s | Символів: %d",
+                user_data['username'],
+                len(summary)
+            )
             
             if len(transcription) > 3000:
-                await status_message.edit_text("📝 *Transcription (Part 1):*", parse_mode='Markdown')
+                await status_message.edit_text("📝 *транскрипція (Частина 1):*", parse_mode='Markdown')
                 chunk_size = 4000
                 transcription_chunks = [transcription[i:i + chunk_size] for i in range(0, len(transcription), chunk_size)]
                 for i, chunk in enumerate(transcription_chunks, 1):
                     await update.message.reply_text(
-                        f"*Transcription (Part {i}):*\n{chunk}",
+                        f"*Транскрипція (Частина {i}):*\n{chunk}",
                         parse_mode='Markdown',
                         reply_markup=reply_markup
                     )
                 
                 await update.message.reply_text(
-                    "📌 *Summary:*\n"
+                    "📌 *Резюме:*\n"
                     f"{summary}",
                     parse_mode='Markdown',
                     reply_markup=reply_markup
                 )
             else:
                 await status_message.edit_text(
-                    "📝 *Transcription:*\n"
+                    "📝 *Транскрипція:*\n"
                     f"{transcription}\n\n"
-                    "📌 *Summary:*\n"
+                    "📌 *Резюме:*\n"
                     f"{summary}",
                     parse_mode='Markdown',
                     reply_markup=reply_markup
                 )
         
         os.unlink(temp_path)
+
     except Exception as e:
-        user_id = update.effective_user.id
-        reply_markup = get_message_keyboard(user_id)
-        await update.message.reply_text(
-            f"❌ Sorry, an error occurred: {str(e)}",
-            reply_markup=reply_markup
+        logger.error(
+            "Помилка при обробці голосового повідомлення | Користувач: %s | Повідомлення: %s",
+            user_data['username'],
+            str(e),
+            exc_info=True
         )
 
 async def transcribe_audio(file_path: str, context: ContextTypes.DEFAULT_TYPE) -> str:
     """Transcribe audio using Whisper via Groq API."""
     try:
         with open(file_path, "rb") as file:
+            logger.info("Запит до API Whisper | Модель: %s", CONFIG["whisper_model"])
             transcription = groq_client.audio.transcriptions.create(
                 file=(file_path, file.read()),
                 model=CONFIG["whisper_model"],
             )
             return transcription.text.strip()
     except Exception as e:
-        print(f"Transcription error: {e}")
-        await context.bot.send_message(chat_id=update.effective_chat.id, text=f"Transcription failed: {e}")
-        return ""
+        logger.error("Ошибка транскрипції: %s", str(e), exc_info=True)
+        raise
+
 
 async def generate_summary(text: str, context: ContextTypes.DEFAULT_TYPE) -> str:
     """Generate a summary using LLama 3 via Groq API."""
     try:
+        logger.info("Запит до API Groq | Модель: %s", CONFIG["summary_model"])
         completion = groq_client.chat.completions.create(
             model=CONFIG["summary_model"],
             messages=[
@@ -194,46 +250,87 @@ async def generate_summary(text: str, context: ContextTypes.DEFAULT_TYPE) -> str
         )
         return completion.choices[0].message.content
     except Exception as e:
-        print(f"Summary error: {e}")
+        logger.error("Ошибка сумаризації: %s", str(e), exc_info=True)
         await context.bot.send_message(chat_id=update.effective_chat.id, text=f"Summary failed: {e}")
         return ""
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle text messages and generate summaries."""
+    user = update.effective_user
+    user_data = get_user_details(user)
+
     try:
-        if update.effective_user.id not in AUTHORIZED_USERS:
-            await update.message.reply_text("⛔ Sorry, you are not authorized to use this bot. Contact @administartor.")
+        if user.id not in AUTHORIZED_USERS:
+            logger.warning(
+            "Спроба несанкціонованого доступу | Дані: %s",
+            user_data
+            )
+            await update.message.reply_text("⛔ Доступ заборонено")
             return
 
-        status_message = await update.message.reply_text("📝 Generating summary...")
+        status_message = await update.message.reply_text("📝 Генерую резюме...")
         text = update.message.text
+        logger.info("Початок сумаризації | Користувач: %s", user_data['username'])
         summary = await generate_summary(text, context)
+        logger.info(
+                "Успішна резюме | Користувач: %s | Символів: %d",
+                user_data['username'],
+                len(summary)
+            )
         user_id = update.effective_user.id
         reply_markup = get_message_keyboard(user_id)
 
         await status_message.edit_text(
-            "📌 *Summary:*\n"
+            "📌 *Резюме:*\n"
             f"{summary}",
             parse_mode='Markdown',
             reply_markup=reply_markup
         )
     except Exception as e:
+        logger.error(
+            "Помилка при сумаризації | Користувач: %s | Повідомлення: %s",
+            user_data['username'],
+            str(e),
+            exc_info=True
+        )
         user_id = update.effective_user.id
         reply_markup = get_message_keyboard(user_id)
         await update.message.reply_text(
-            f"❌ Sorry, an error occurred: {str(e)}",
+            f"❌ Вибачте, сталася помилка: {str(e)}",
             reply_markup=reply_markup
         )
 
 async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Log Errors caused by Updates."""
-    print(f"Update {update} caused error {context.error}")
+    error = context.error
+    user_data = {}
+    
+    if update.effective_user:
+        user_data = get_user_details(update.effective_user)
+    
+    logger.error(
+        "Критична помилка | Користувач: %s | Помилка: %s",
+        user_data.get('username', 'N/A'),
+        str(error),
+        exc_info=error
+    )
+    
+    if update.effective_message:
+        logger.debug(
+            "Контекст помилки | Чат: %d | Повідомлення: %s",
+            update.effective_chat.id,
+            update.effective_message.text
+        )
 
 # --- Admin Commands ---
 async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle admin commands."""
     if not is_admin(update.effective_user.id):
-        await update.message.reply_text("⛔ Only the administrator can remote this bot.")
+        logger.warning(
+            "Спроба несанкціонованого доступу | Дані: %s",
+            user_data
+            )
+        await update.message.reply_text("⛔ Тільки адміністратор може виконати цю команду.")
         return
 
     command = update.effective_message.text.split()[0]
@@ -247,11 +344,11 @@ async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if model_name in available_models:
                     CONFIG["whisper_model"] = model_name
                     save_config()
-                    await update.message.reply_text(f"✅ Whisper model updated: {model_name}")
+                    await update.message.reply_text(f"✅ Оновлено модель Whisper: {model_name}")
                 else:
                     whisper_models = [m for m in available_models if "whisper" in m.lower()]
                     await update.message.reply_text(
-                        "❌ Invalid Whisper model. Available options:\n" +
+                        "❌ Неправильна модель Whisper. Доступні опції:\n" +
                         "\n".join(whisper_models)
                     )
 
@@ -263,7 +360,7 @@ async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_text(f"✅ Summary model updated: {model_name}")
             else:
                 await update.message.reply_text(
-                    "❌ Invalid model. Available LLM models:\n" +
+                    "❌ Неправильна модель. Доступні моделі LLM:\n" +
                     "\n".join([m for m in available_models if "whisper" not in m.lower()])
                 )
 
@@ -272,24 +369,29 @@ async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if user_id not in AUTHORIZED_USERS:
                 AUTHORIZED_USERS.append(user_id)
                 save_users()
-                await update.message.reply_text(f"✅ User {user_id} added")
+                await update.message.reply_text(f"✅ Користувача {user_id} додано")
 
         elif command == "/remove_user":
             user_id = int(args[0])
             if user_id in AUTHORIZED_USERS:
                 AUTHORIZED_USERS.remove(user_id)
                 save_users()
-                await update.message.reply_text(f"❌ User {user_id} removed")
+                await update.message.reply_text(f"❌ Користувача {user_id} видалено")
 
         elif command == "/list_models":
             models = "\n".join([
-                f"🔊 *Whisper Models:*\n{', '.join([m for m in available_models if 'whisper' in m.lower()])}\n\n"
-                f"🧠 *LLM Models:*\n{', '.join([m for m in available_models if 'whisper' not in m.lower()])}"
+                f"🔊 *Моделі Whisper:*\n{', '.join([m for m in available_models if 'whisper' in m.lower()])}\n\n"
+                f"🧠 *Моделі LLM:*\n{', '.join([m for m in available_models if 'whisper' not in m.lower()])}"
             ])
             await update.message.reply_text(models, parse_mode='Markdown')
 
     except IndexError:
-        await update.message.reply_text("❌ Missing arguments!")
+        logger.error(
+            "Контекст помилки | Чат: %d | Повідомлення: %s",
+            update.effective_chat.id,
+            update.effective_message.text
+        )
+        await update.message.reply_text("❌ Не знайдено аргумент")
 
 def save_users():
     """Save authorized users to file."""
@@ -309,16 +411,16 @@ async def post_init(application: Application):
 def get_admin_keyboard(auth):
     keyboard = [
         [
-            InlineKeyboardButton("Add User", callback_data="add_user"),
-            InlineKeyboardButton("Remove User", callback_data="remove_user")
+            InlineKeyboardButton("Додати користувача", callback_data="add_user"),
+            InlineKeyboardButton("Видалити користувача", callback_data="remove_user")
         ],
         [
-            InlineKeyboardButton("Set Whisper Model", callback_data="set_whisper"),
-            InlineKeyboardButton("Set Summary Model", callback_data="set_summary")
+            InlineKeyboardButton("Встановити модель Whisper", callback_data="set_whisper"),
+            InlineKeyboardButton("Встановити модель LLM", callback_data="set_summary")
         ],
         [
-            InlineKeyboardButton("List Models", callback_data="list_models"),
-            *([InlineKeyboardButton("Mode", callback_data="change_mode")] if auth else [])
+            InlineKeyboardButton("Список моделей", callback_data="list_models"),
+            *([InlineKeyboardButton("Режим", callback_data="change_mode")] if auth else [])
         ]
     ]
     return InlineKeyboardMarkup(keyboard)
@@ -326,12 +428,17 @@ def get_admin_keyboard(auth):
 async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show admin panel with inline keyboard."""
     if not is_admin(update.effective_user.id):
-        await update.message.reply_text("⛔ Only the administrator can access this panel.")
+        user_data = get_user_details(user)
+        logger.warning(
+            "Спроба доступу до адмінки | Дані: %s",
+            user_data
+        )
+        await update.message.reply_text("⛔ Потрібні права адміністратора")
         return
 
     auth=update.effective_user.id not in AUTHORIZED_USERS
     await update.message.reply_text(
-        "🔧 Admin Control Panel",
+        "🔧 Адмінська панель",
         reply_markup=get_admin_keyboard(auth=auth)
     )
 
@@ -342,24 +449,29 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     reply_markup = get_message_keyboard(user_id)
     auth=update.effective_user.id in AUTHORIZED_USERS
+    user_data = get_user_details(update.effective_user)
 
     if not auth or not is_admin(update.effective_user.id):
-        await query.message.edit_text(
-            "⛔ Access denied",
-            reply_markup=reply_markup
-        )
-        return   
+        logger.warning(
+            "Спроба несанкціонованого доступу | Дані: %s",
+            user_data
+            )
+        if update.message:
+            await update.message.reply_text("⛔ Доступ заборонено")
+        elif update.callback_query:
+            await update.callback_query.answer("⛔ Доступ заборонено")
+        return
 
     if query.data == "change_mode":
         keyboard = [
             [
-                InlineKeyboardButton("Transcription only", callback_data="mode_transcription"),
-                InlineKeyboardButton("Transcription + Summary", callback_data="mode_both")
+                InlineKeyboardButton("Тільки транскрипція", callback_data="mode_transcription"),
+                InlineKeyboardButton("Транскрипція + Резюме", callback_data="mode_both")    
             ],
             [InlineKeyboardButton("« Back", callback_data="back_to_main")]
         ]
         await query.message.edit_text(
-            "Select processing mode:",
+            "Оберіть режим обробки:",
             reply_markup=InlineKeyboardMarkup(keyboard)
         )
 
@@ -369,7 +481,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         CONFIG["user_modes"][user_id] = "transcription"
         save_config()
         await query.message.edit_text(
-            "✅ Mode set to: *Transcription only*\n\nSend me a voice message to try it!",
+            "✅ Режим встановлено на: *Тільки транскрипція*\n\nНадішліть мені голосове повідомлення, щоб спробувати!",
             parse_mode='Markdown',
             reply_markup=reply_markup
         )
@@ -380,10 +492,10 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         CONFIG["user_modes"][user_id] = "both"
         save_config()
         await query.message.edit_text(
-            "✅ Mode set to: *Transcription + Summary*\n\nSend me a voice message to try it!",
+            "✅ Режим встановлено на: *Транскрипція + Резюме*\n\nНадішліть мені голосове повідомлення, щоб спробувати!",
             parse_mode='Markdown',
             reply_markup=reply_markup
-        )
+        )   
 
     elif query.data == "back_to_main":
         user_id = update.effective_user.id
@@ -394,17 +506,17 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
     elif query.data == "add_user":
-        await query.message.edit_text("Please send the user ID to add using:\n/add_user <user_id>")
+        await query.message.edit_text("Будь ласка, надішліть ідентифікатор користувача для додавання за допомогою:\n/add_user <user_id>")
     
     elif query.data == "remove_user":
-        await query.message.edit_text("Please send the user ID to remove using:\n/remove_user <user_id>")
+        await query.message.edit_text("Будь ласка, надішліть ID користувача для видалення за допомогою:\n/remove_user <user_id>")
     
     elif query.data == "set_whisper":
         models = [m for m in context.application.bot_data["available_models"] if 'whisper' in m.lower()]
         keyboard = [[InlineKeyboardButton(m, callback_data=f"select_whisper_{m}")] for m in models]
         keyboard.append([InlineKeyboardButton("« Back", callback_data="back_to_menu")])
         await query.message.edit_text(
-            "Select Whisper model:",
+            "Виберіть модель Whisper:",
             reply_markup=InlineKeyboardMarkup(keyboard)
         )
     
@@ -413,7 +525,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         keyboard = [[InlineKeyboardButton(m, callback_data=f"select_summary_{m}")] for m in models]
         keyboard.append([InlineKeyboardButton("« Back", callback_data="back_to_menu")])
         await query.message.edit_text(
-            "Select Summary model:",
+            "Вибиріть модель для резюме:",
             reply_markup=InlineKeyboardMarkup(keyboard)
         )
     
@@ -422,7 +534,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         CONFIG["whisper_model"] = model_name
         save_config()
         await query.message.edit_text(
-            f"✅ Whisper model has been updated to:\n*{model_name}*",
+            f"✅ Whisper модель була оновлена до:\n*{model_name}*",
             parse_mode='Markdown',
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("« Back", callback_data="back_to_menu")]])
         )
@@ -432,7 +544,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         CONFIG["summary_model"] = model_name
         save_config()
         await query.message.edit_text(
-            f"✅ Summary model has been updated to:\n*{model_name}*",
+            f"✅ Модель для резюме була оновлена до:\n*{model_name}*",
             parse_mode='Markdown',
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("« Back", callback_data="back_to_menu")]])
         )
@@ -440,9 +552,9 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif query.data == "list_models":
         available_models = context.application.bot_data["available_models"]
         models_text = (
-            "🔊 *Whisper Models:*\n" +
+            "🔊 *Whisper моделі:*\n" +
             "\n".join([m for m in available_models if 'whisper' in m.lower()]) +
-            "\n\n🧠 *LLM Models:*\n" +
+            "\n\n🧠 *LLM моделі:*\n" +
             "\n".join([m for m in available_models if 'whisper' not in m.lower()])
         )
         keyboard = [[InlineKeyboardButton("« Back", callback_data="back_to_menu")]]
@@ -452,15 +564,9 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=InlineKeyboardMarkup(keyboard)
         )
     
-    elif query.data == "admin_panel":
+    elif query.data == "admin_panel" or query.data == "back_to_menu":
         await query.message.edit_text(
-            "🔧 Admin Control Panel",
-            reply_markup=get_admin_keyboard(auth=auth)
-        )
-
-    elif query.data == "back_to_menu":
-        await query.message.edit_text(
-            "🔧 Admin Control Panel",
+            "🔧 Адмінська панель",
             reply_markup=get_admin_keyboard(auth=auth)
         )
     
@@ -472,17 +578,17 @@ async def mode_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     keyboard = [
         [
-            InlineKeyboardButton("Transcription only", callback_data="mode_transcription"),
-            InlineKeyboardButton("Transcription + Summary", callback_data="mode_both")
+            InlineKeyboardButton("Тільки транскрипція", callback_data="mode_transcription"),
+            InlineKeyboardButton("Транскрипція + Резюме", callback_data="mode_both")
         ]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
     
     current_mode = CONFIG.get("user_modes", {}).get(user_id, "both")
-    mode_text = "Transcription + Summary" if current_mode == "both" else "Transcription only"
+    mode_text = "Транскрипція + Резюме" if current_mode == "both" else "Тільки транскрипція"
     
     await update.message.reply_text(
-        f"Select processing mode:\n\nCurrent mode: *{mode_text}*",
+        f"Виберіть режим обробки:\n\nПоточний режим: *{mode_text}*",
         parse_mode='Markdown',
         reply_markup=reply_markup
     )
@@ -499,6 +605,7 @@ def setup_admin(application: Application):
 
 # --- Main ---
 if __name__ == '__main__':
+    logger.info("Запуск бота...")
     application = (
         Application.builder()
         .token(os.getenv("TELEGRAM_BOT_TOKEN"))
@@ -514,4 +621,9 @@ if __name__ == '__main__':
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     application.add_error_handler(error_handler)
 
-    application.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
+    try:
+        application.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
+        logger.info("Бот успішно виконав роботу")
+    except Exception as e:
+        logger.critical("Помилка запуску бота: %s", str(e), exc_info=True)
+        raise

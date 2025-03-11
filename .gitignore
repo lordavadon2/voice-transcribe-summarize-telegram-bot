@@ -6,3 +6,4 @@ __pycache__
 .dokku/MY_DOKKU.md 
 authorized_users.json
 config.json
+bot.log
